@@ -338,10 +338,11 @@ mod pty_tests {
         sh.get(0).unwrap().write(b"'LOC1=' + (Get-Location).Path; cd ..; 'LOC2=' + (Get-Location).Path; exit\r\n").unwrap();
         let mut all = String::new();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            while let Some(b) = p.out.recv().await {
+            while let Some(m) = sh.rx.recv().await {
+                let Some(b) = m.data else { break };
                 let s = String::from_utf8_lossy(&b).to_string();
                 if s.contains("\x1b[6n") {
-                    p.write(b"\x1b[1;1R").unwrap(); // answer the cursor-position query like a terminal
+                    sh.get(0).unwrap().write(b"\x1b[1;1R").unwrap(); // answer the cursor-position query like a terminal
                 }
                 all.push_str(&s);
             }
