@@ -34,9 +34,6 @@ a second launch tells you to look in the notification area (click the `^` arrow 
 `terminal-tunnel.exe` is the console build of the same program (`terminal-tunnel host-web --tray` also
 works from a terminal; add `--hide-console` to detach).
 
-For a Start Menu entry (and optionally start-with-Windows) run `pwsh assets\install-shortcut.ps1`
-(`-Startup` to also start at sign-in, `-Root D:/Development` to pass `--root`, `-Remove` to undo).
-
 It runs in the notification area (built on the Microsoft [`windows`](https://github.com/microsoft/windows-rs)
 crate) and keeps the Dev Tunnel and relay up, so nothing needs restarting:
 
