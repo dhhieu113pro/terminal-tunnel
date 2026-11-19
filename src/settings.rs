@@ -1,7 +1,7 @@
 //! User settings: a small JSON file next to the executable (created on first run), and on Windows a
 //! native settings window to edit it.
 //!
-//! Precedence for every option: command line > environment / `.env` > this file > built-in default.
+//! Precedence for every option: command line > environment > this file > built-in default.
 //! That is achieved by exporting the file's values as `TT_*` environment variables for the options
 //! that are not already set, so clap's `env` support does the rest.
 
@@ -107,7 +107,7 @@ pub fn validate(s: &Settings) -> Result<()> {
 }
 
 /// Export the settings as `TT_*` variables, but only for options not already set (so the real
-/// environment, `.env` and the command line keep priority).
+/// environment and the command line keep priority).
 pub fn apply_env(s: &Settings) {
     let set = |k: &str, v: String| {
         if std::env::var_os(k).is_none() {

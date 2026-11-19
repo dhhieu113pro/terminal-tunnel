@@ -25,9 +25,9 @@ cargo build --release
 copy target\release\terminal-tunnel-tray.exe dist\      # (dist\ already holds the last build)
 ```
 
-It is a Windows **GUI program**: no console window ever opens. Its settings come from a `.env` found
-next to the exe, in the repo root above `dist\` or `target\release\`, or in
-`%APPDATA%\terminal-tunnel\.env`; or pass options in a shortcut (`--root D:/Development`). Problems
+It is a Windows **GUI program**: no console window ever opens. Its settings come from the settings
+window (tray menu: **Settings...**, saved as `terminal-tunnel.json` next to the exe or in
+`%APPDATA%\terminal-tunnel`) or from options in a shortcut (`--root D:/Development`). Problems
 (bad config, tunnel not logged in, already running) are shown in a message box. Only one copy can run:
 a second launch tells you to look in the notification area (click the `^` arrow if the icon is hidden).
 
@@ -68,13 +68,11 @@ iPhone home-screen icon.
   the keyboard, the terminal refits and the host PTY is resized to match.
 - With `TT_ROOT` set, the PowerShell prompt shows the root as `~`: `PS ~>`, `PS ~\sub>`.
 
-## Configuration (`.env`)
+## Configuration
 
-Settings can live in a git-ignored `.env` file (copy `.env-example`). It is searched in the working
-directory and its parents, then next to the executable. Real environment variables override it.
-A `.env` that cannot be parsed is a startup error. Values are `KEY=value` lines. **A backslash is an
-escape character**, so write Windows paths with forward slashes (`TT_ROOT=D:/Development`) or in single
-quotes (`TT_ROOT='D:\Development'`). Unquoted `D:\Development` fails to parse.
+Options come from the command line, the settings window (tray menu: **Settings...**, stored in
+`terminal-tunnel.json`) or `TT_*` environment variables. Precedence: command line > environment >
+settings file > default.
 
 | Variable | Flag | Meaning |
 |----------|------|---------|
@@ -85,7 +83,7 @@ quotes (`TT_ROOT='D:\Development'`). Unquoted `D:\Development` fails to parse.
 | `TT_DEVTUNNEL_ID` | `--devtunnel-id` | Name of the persistent Dev Tunnel (default `terminal-tunnel`) |
 | `TT_DEVTUNNEL_ANONYMOUS` | `--devtunnel-anonymous` | Allow anonymous access to the tunnel (default: sign-in required) |
 
-`host-web` prints the loaded `.env` and the effective root at startup, so check those lines.
+`host-web` prints the settings file used and the effective root at startup, so check those lines.
 In this repo `.cargo/config.toml` sets `TT_DEVTUNNEL=1` for `cargo run`; override with
 `TT_DEVTUNNEL=0 cargo run -- host-web --signal https://...`.
 

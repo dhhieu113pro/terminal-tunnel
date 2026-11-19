@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(run(&root, "cd sub; cd .."), root_s);
         assert_eq!(run(&root, "cd -Path .."), root_s);
         assert_eq!(run(&root, "cd -LiteralPath C:\\Windows"), root_s);
-        // a root written with forward slashes (as in .env) behaves the same
+        // a root written with forward slashes behaves the same
         let fwd = std::path::PathBuf::from(root_s.replace('\\', "/"));
         assert_eq!(run(&fwd, "cd sub"), format!("{root_s}\\sub"));
         assert_eq!(run(&fwd, "cd .."), root_s);

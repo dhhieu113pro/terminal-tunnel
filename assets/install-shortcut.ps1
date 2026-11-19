@@ -2,7 +2,7 @@
 #
 #   pwsh assets\install-shortcut.ps1                       # Start Menu entry
 #   pwsh assets\install-shortcut.ps1 -Startup              # ...and start it when you sign in to Windows
-#   pwsh assets\install-shortcut.ps1 -Root D:/Development  # pass --root (otherwise TT_ROOT from .env is used)
+#   pwsh assets\install-shortcut.ps1 -Root D:/Development  # pass --root (otherwise the root from the settings file is used)
 #   pwsh assets\install-shortcut.ps1 -Remove               # delete both shortcuts again
 #
 # Run it from the repo (it points at dist\terminal-tunnel-tray.exe, or target\release\ if dist\ is missing).
