@@ -44,10 +44,10 @@ enum Cmd {
         /// Port for the embedded relay server.
         #[arg(long, env = "TT_PORT", default_value_t = 8080)]
         port: u16,
-        /// Expose the embedded relay server through a Microsoft Dev Tunnel (needs the `devtunnel`
-        /// CLI, logged in). This is how the QR link works over the internet. An explicit --signal
-        /// takes precedence.
-        #[arg(long, env = "TT_DEVTUNNEL", value_parser = clap::builder::BoolishValueParser::new())]
+        /// Expose the embedded relay server through a Microsoft Dev Tunnel (default: on; needs the
+        /// `devtunnel` CLI, logged in). This is how the QR link works over the internet. An explicit
+        /// --signal takes precedence; turn off with `--devtunnel=false` or TT_DEVTUNNEL=0.
+        #[arg(long, env = "TT_DEVTUNNEL", value_parser = clap::builder::BoolishValueParser::new(), default_value_t = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         devtunnel: bool,
         /// With --devtunnel: allow anonymous access to the tunnel. By default the tunnel requires
         /// signing in as the owner (the account used by `devtunnel user login`).
@@ -197,7 +197,7 @@ async fn run(cli: Cli, settings_file: Option<std::path::PathBuf>) -> Result<()> 
             let shell = shell.unwrap_or_else(default_shell);
             // The tray is for real use from a phone: it always goes through the Dev Tunnel unless a
             // relay URL is given explicitly.
-            let devtunnel = devtunnel || (tray && signal.is_none());
+            let devtunnel = signal.is_none() && (devtunnel || tray);
             if tray {
                 #[cfg(windows)]
                 return web::host_tray(shell, root, signal, port, devtunnel, devtunnel_anonymous, devtunnel_id, hide_console).await;

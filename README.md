@@ -10,7 +10,7 @@ https, it works through firewalls, NAT, VPNs and mobile networks (e.g. via a Mic
 
 ```
 # one-time: winget install Microsoft.devtunnel ; devtunnel user login
-cargo run -q -- host-web --devtunnel
+cargo run -q -- host-web            # the Dev Tunnel is the default
 ```
 
 Scan the QR code with the phone camera, sign in when asked, and you get a shell. The link is
@@ -79,7 +79,7 @@ quotes (`TT_ROOT='D:\Development'`). Unquoted `D:\Development` fails to parse.
 | Variable | Flag | Meaning |
 |----------|------|---------|
 | `TT_ROOT` | `--root` | Directory the shared shell starts in, e.g. `D:\Development`. For PowerShell, `cd`/`Set-Location`/`Push-Location` that would leave it are undone (**soft guard**). Startup fails if it doesn't exist. |
-| `TT_DEVTUNNEL` | `--devtunnel` | Expose the embedded relay through a Dev Tunnel (see below) |
+| `TT_DEVTUNNEL` | `--devtunnel` | Expose the embedded relay through a Dev Tunnel (default on; `--devtunnel=false` or `TT_DEVTUNNEL=0` to turn off; see below) |
 | `TT_TRAY` | `--tray` | Windows tray mode (see above) |
 | `TT_HIDE_CONSOLE` | `--hide-console` | With `--tray`: detach from the console |
 | `TT_DEVTUNNEL_ID` | `--devtunnel-id` | Name of the persistent Dev Tunnel (default `terminal-tunnel`) |
