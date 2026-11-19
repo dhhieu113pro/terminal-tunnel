@@ -1,0 +1,4 @@
+# Applies to `cargo run` / `cargo build` in this repo only (not the installed binary).
+# Override per run with e.g. `TT_DEVTUNNEL=0 cargo run -- host-web`.
+[env]
+TT_DEVTUNNEL = "1"
