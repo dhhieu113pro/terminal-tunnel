@@ -23,7 +23,14 @@
   #logpane.open { display:flex; }
   #logtext { flex:1; margin:0; padding:6px 8px; overflow:auto; font:11px/1.4 ui-monospace,Menlo,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; -webkit-user-select:text; }
   #logbar { display:flex; gap:6px; padding:4px 8px; background:var(--bar); }
-  #term { flex:1; min-height:0; padding:4px; }
+  #tabs { flex:0 0 auto; display:flex; gap:4px; align-items:center; padding:4px 6px; background:var(--bar); overflow-x:auto; touch-action:manipulation; -webkit-user-select:none; user-select:none; }
+  #tabs button { flex:0 0 auto; min-width:38px; height:32px; padding:0 12px; border:0; border-radius:6px; background:#21262d; color:var(--fg); font:600 13px system-ui,sans-serif; }
+  #tabs button.active { background:var(--accent); color:#000; }
+  #tabs .sp { flex:1; }
+  #tabs #closetab { background:#3a1f22; color:#ffb4b4; }
+  #term { flex:1; min-height:0; padding:4px; position:relative; }
+  .pane { position:absolute; inset:4px; display:none; }
+  .pane.active { display:block; }
   /* Termux-style extra keys: two rows of seven. */
   #keys { flex:0 0 auto; display:grid; grid-template-columns:repeat(7, 1fr); gap:5px; padding:6px 6px calc(6px + env(safe-area-inset-bottom)); background:#0b0f14;
           touch-action:manipulation; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
@@ -40,6 +47,7 @@
     <pre id="logtext"></pre>
     <div id="logbar"><button id="logcopy" type="button">Copy log</button><button id="logclose" type="button">Close</button></div>
   </div>
+  <div id="tabs"></div>
   <div id="term"></div>
   <div id="keys">
     <button type="button" data-k="&#x1b;">ESC</button>
@@ -111,7 +119,7 @@ function hmacSha256(key, msg) {
   const statusEl = document.getElementById('status'), msgEl = document.getElementById('msg');
   const logPane = document.getElementById('logpane'), logText = document.getElementById('logtext');
   const lines = [];
-  const refit = () => setTimeout(() => { try { fit.fit(); } catch (e) { /* terminal not ready yet */ } }, 50);
+  const refit = () => setTimeout(() => { try { cur().fit.fit(); } catch (e) { /* terminal not ready yet */ } }, 50);
   const log = t => {                         // timestamped event log, shown in the Log panel
     lines.push(new Date().toTimeString().slice(0, 8) + ' ' + t);
     if (lines.length > 300) lines.shift();
@@ -145,12 +153,54 @@ function hmacSha256(key, msg) {
     setStatus('Could not load the terminal scripts from ' + location.host + ': the host has probably stopped (it exits when a session ends or the link expires). Restart host-web and rescan.', 'err');
     return;
   }
-  const term = new Terminal({ fontSize: 14, cursorBlink: true, scrollback: 5000,
-                              theme: { background: '#0d1117' } });
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(document.getElementById('term'));
-  fit.fit();
+  // One xterm per shell (tab). The host keeps every shell running; ids are 0..7.
+  const MAX_SHELLS = 8;
+  const termHost = document.getElementById('term'), tabsEl = document.getElementById('tabs');
+  const shells = new Map();                  // id -> { term, fit, pane, tab }
+  let activeId = null;
+  const cur = () => shells.get(activeId);
+  const focusTerm = () => { const s = cur(); if (s) s.term.focus(); };
+  const addTab = document.createElement('button'); addTab.type = 'button'; addTab.textContent = '+';
+  const spacer = document.createElement('span'); spacer.className = 'sp';
+  const closeTab = document.createElement('button'); closeTab.type = 'button'; closeTab.id = 'closetab'; closeTab.textContent = 'Close';
+  tabsEl.append(addTab, spacer, closeTab);
+  function addShell(id) {
+    if (shells.has(id)) return;
+    const pane = document.createElement('div'); pane.className = 'pane'; termHost.appendChild(pane);
+    const term = new Terminal({ fontSize: 14, cursorBlink: true, scrollback: 5000, theme: { background: '#0d1117' } });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(pane);
+    term.onData(d => onTermData(id, d));
+    const tab = document.createElement('button'); tab.type = 'button'; tab.textContent = String(id + 1);
+    tab.onclick = () => { activate(id); focusTerm(); };
+    tabsEl.insertBefore(tab, addTab);
+    shells.set(id, { term, fit, pane, tab });
+    addTab.style.display = shells.size >= MAX_SHELLS ? 'none' : '';
+  }
+  function activate(id) {
+    if (!shells.has(id)) return;
+    activeId = id;
+    for (const [i, s] of shells) { s.pane.classList.toggle('active', i === id); s.tab.classList.toggle('active', i === id); }
+    try { sendResize(); } catch (e) { /* not connected yet */ }
+  }
+  function removeShell(id) {
+    const s = shells.get(id); if (!s) return;
+    s.term.dispose(); s.pane.remove(); s.tab.remove(); shells.delete(id);
+    addTab.style.display = '';
+    if (activeId === id) { activeId = null; const next = shells.keys().next(); if (!next.done) activate(next.value); }
+  }
+  function openShell() {                     // new tab: lowest free id
+    let id = 0; while (shells.has(id)) id++;
+    if (id >= MAX_SHELLS) return;
+    addShell(id); sendMsg(5, new Uint8Array([id])); activate(id); focusTerm();
+  }
+  addTab.onclick = openShell;
+  closeTab.onclick = () => {
+    if (activeId === null) return;
+    const id = activeId; sendMsg(6, new Uint8Array([id])); removeShell(id);
+    if (shells.size === 0) openShell();      // always keep one shell
+  };
 
   const enc = new TextEncoder();
   let ctrl = false, verified = false, transcript = '';
@@ -158,10 +208,15 @@ function hmacSha256(key, msg) {
   const sameBytes = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
   let wsOut = null;   // set once the handshake is done: encrypts and sends a frame
   const sendMsg = (type, bytes) => { if (wsOut) wsOut(type, bytes); };
-  const sendInput = s => sendMsg(1, enc.encode(s));
+  const sendInput = (s, id = activeId) => {
+    if (id === null) return;
+    const b = enc.encode(s), m = new Uint8Array(1 + b.length); m[0] = id; m.set(b, 1);
+    sendMsg(1, m);
+  };
   const sendResize = () => {
-    fit.fit();
-    sendMsg(2, new Uint8Array([term.cols >> 8, term.cols & 255, term.rows >> 8, term.rows & 255]));
+    const s = cur(); if (!s) return;
+    s.fit.fit();
+    sendMsg(2, new Uint8Array([activeId, s.term.cols >> 8, s.term.cols & 255, s.term.rows >> 8, s.term.rows & 255]));
   };
 
   // Keep the app exactly as tall as the visible area: when the on-screen keyboard opens, the visual
@@ -193,7 +248,7 @@ function hmacSha256(key, msg) {
     e.preventDefault();
     set(!get());
     btn.classList.toggle('on', get());
-    term.focus();
+    focusTerm();
   });
   sticky(ctrlBtn, () => ctrl, v => { ctrl = v; });
   sticky(altBtn, () => alt, v => { alt = v; });
@@ -204,12 +259,12 @@ function hmacSha256(key, msg) {
     b.addEventListener('pointerdown', e => {
       e.preventDefault();
       fire();
-      term.focus();
+      focusTerm();
       if (b.hasAttribute('data-repeat')) delay = setTimeout(() => { timer = setInterval(fire, 70); }, 380);   // hold to repeat
     });
     for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) b.addEventListener(ev, stop);
   });
-  term.onData(d => {
+  const onTermData = (id, d) => {
     if (ctrl && d.length === 1) {            // sticky CTRL
       const c = d.toUpperCase().charCodeAt(0);
       if (c >= 64 && c <= 95) d = String.fromCharCode(c - 64);
@@ -218,8 +273,8 @@ function hmacSha256(key, msg) {
       d = '\x1b' + d;
       alt = false; altBtn.classList.remove('on');
     }
-    sendInput(d);
-  });
+    sendInput(d, id);
+  };
 
   // The terminal travels over a WebSocket (through the tunnel), every frame AES-256-GCM encrypted
   // with keys derived from the token (which the tunnel never sees).
@@ -288,9 +343,7 @@ function hmacSha256(key, msg) {
         const b = mac('sas'), n = ((b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]) >>> 0) % 1000000;
         const code = String(Math.floor(n / 1000)).padStart(3, '0') + ' ' + String(n % 1000).padStart(3, '0');
         setStatus('Connected (end-to-end encrypted over WebSocket, verified) · match code ' + code);
-        wsOut(0, new Uint8Array(0));            // first encrypted frame: proves the token, starts the shell
-        sendResize();
-        term.focus();
+        wsOut(0, new Uint8Array(0));            // first encrypted frame: proves the token; the host answers with its shell list
         setInterval(() => wsOut(3, new Uint8Array(0)), 20000);   // keep-alive through proxies
         return;
       }
@@ -303,8 +356,15 @@ function hmacSha256(key, msg) {
         plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce(2, ctr), additionalData: AAD }, kH2C, f.subarray(8)));
       } catch (err) { return end('Decryption failed: tampered data or wrong token. Disconnected.', 'err'); }
       recvCtr++;
-      if (plain[0] === 1) term.write(plain.subarray(1));
-      else if (plain[0] === 4) end('The shell has exited.', 'warn');
+      if (plain[0] === 7) {                    // shells that already run on the host (reconnect)
+        for (const id of plain.subarray(1)) addShell(id);
+        if (shells.size === 0) openShell();
+        else { activate(shells.keys().next().value); focusTerm(); }
+      } else if (plain[0] === 1) { const s = shells.get(plain[1]); if (s) s.term.write(plain.subarray(2)); }
+      else if (plain[0] === 4) {
+        removeShell(plain[1]);
+        if (shells.size === 0) { log('last shell exited: starting a new one'); openShell(); }
+      }
     };
     ws.onmessage = e => { recvQ = recvQ.then(() => handle(e)).catch(err => end('Error: ' + (err && err.message || err), 'err')); };
 

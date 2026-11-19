@@ -75,24 +75,35 @@ pub fn shell_command(shell: &str, root: Option<&std::path::Path>) -> CommandBuil
     cmd
 }
 
-/// A shell running in a pseudo-terminal. Output arrives on `out`.
+/// Max shells (tabs) per host.
+pub const MAX_SHELLS: usize = 8;
+
+/// Output or exit of one shell, tagged so a stale message from a replaced shell can be ignored.
+pub struct ShellMsg {
+    pub id: u8,
+    pub generation: u64,
+    /// `None`: the shell exited.
+    pub data: Option<Vec<u8>>,
+}
+
+/// A shell running in a pseudo-terminal.
 pub struct Pty {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    pub out: mpsc::Receiver<Vec<u8>>,
     buf: Arc<Mutex<Buf>>,
+    generation: u64,
 }
 
 impl Pty {
-    pub fn spawn(shell: &str, cwd: Option<&std::path::Path>) -> Result<Self> {
+    /// Start a shell. Its output (while attached) and its exit go to `tx` tagged with `id`/`generation`.
+    pub fn spawn(shell: &str, cwd: Option<&std::path::Path>, id: u8, generation: u64, tx: mpsc::Sender<ShellMsg>) -> Result<Self> {
         let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })?;
         let child = pair.slave.spawn_command(shell_command(shell, cwd))?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
-        let (tx, out) = mpsc::channel::<Vec<u8>>(64);
         let shared = Arc::new(Mutex::new(Buf::default()));
         let thread_buf = shared.clone();
         std::thread::spawn(move || {
@@ -111,12 +122,13 @@ impl Pty {
                     }
                     b.attached
                 };
-                if attached && tx.blocking_send(chunk).is_err() {
-                    break;
+                if attached && tx.blocking_send(ShellMsg { id, generation, data: Some(chunk) }).is_err() {
+                    return;
                 }
             }
+            let _ = tx.blocking_send(ShellMsg { id, generation, data: None });
         });
-        Ok(Self { writer, master: pair.master, child, out, buf: shared })
+        Ok(Self { writer, master: pair.master, child, buf: shared, generation })
     }
 
     /// Still running (the shell has not exited)?
@@ -124,16 +136,15 @@ impl Pty {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// A phone connects: returns everything shown so far (to redraw the screen) and starts live output.
-    pub fn attach(&mut self) -> Vec<u8> {
+    /// Start live output; returns everything shown so far (to redraw the screen).
+    fn attach(&mut self) -> Vec<u8> {
         let mut b = self.buf.lock().unwrap();
-        while self.out.try_recv().is_ok() {}
         b.attached = true;
         b.scroll.clone()
     }
 
     /// The phone went away: the shell keeps running, its output only goes to the scrollback.
-    pub fn detach(&mut self) {
+    fn detach(&mut self) {
         self.buf.lock().unwrap().attached = false;
     }
 
@@ -152,6 +163,93 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         let _ = self.child.kill();
+    }
+}
+
+/// The host's set of shells (one per phone tab), shared by all phone connections: they keep
+/// running while no phone is connected.
+pub struct Shells {
+    slots: Vec<Option<Pty>>,
+    tx: mpsc::Sender<ShellMsg>,
+    /// Output / exit messages of all attached shells.
+    pub rx: mpsc::Receiver<ShellMsg>,
+    next_generation: u64,
+}
+
+impl Default for Shells {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Shells {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel(256);
+        Self { slots: (0..MAX_SHELLS).map(|_| None).collect(), tx, rx, next_generation: 1 }
+    }
+
+    pub fn get(&mut self, id: u8) -> Option<&mut Pty> {
+        self.slots.get_mut(id as usize)?.as_mut()
+    }
+
+    /// Start a shell in slot `id` (a phone tab). Replaces nothing: fails if the slot is in use.
+    /// The new shell is attached right away (a phone is connected when this is called).
+    pub fn open(&mut self, id: u8, shell: &str, root: Option<&std::path::Path>) -> Result<()> {
+        let n = id as usize;
+        anyhow::ensure!(n < MAX_SHELLS, "at most {MAX_SHELLS} shells");
+        anyhow::ensure!(self.slots[n].is_none(), "shell {id} already exists");
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        let mut p = Pty::spawn(shell, root, id, generation, self.tx.clone())?;
+        p.attach();
+        self.slots[n] = Some(p);
+        Ok(())
+    }
+
+    /// Stop shell `id`.
+    pub fn close(&mut self, id: u8) {
+        if let Some(slot) = self.slots.get_mut(id as usize) {
+            *slot = None; // Drop kills the child
+        }
+    }
+
+    /// Handle an exit message: forget the shell. Returns true if it was the current one in its slot.
+    pub fn on_exit(&mut self, msg: &ShellMsg) -> bool {
+        match self.slots.get_mut(msg.id as usize) {
+            Some(slot) if slot.as_ref().is_some_and(|p| p.generation == msg.generation) => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Is this output for the shell currently in its slot (not a stale one)?
+    pub fn is_current(&self, msg: &ShellMsg) -> bool {
+        self.slots.get(msg.id as usize).and_then(|s| s.as_ref()).is_some_and(|p| p.generation == msg.generation)
+    }
+
+    /// A phone connected: drop shells that died while it was away, discard queued messages, start
+    /// live output and return `(id, screen so far)` for every live shell.
+    pub fn attach_all(&mut self) -> Vec<(u8, Vec<u8>)> {
+        while self.rx.try_recv().is_ok() {}
+        let mut out = Vec::new();
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.as_mut().is_some_and(|p| !p.is_alive()) {
+                *slot = None;
+            }
+            if let Some(p) = slot {
+                out.push((i as u8, p.attach()));
+            }
+        }
+        out
+    }
+
+    /// The phone went away: shells keep running, output only goes to their scrollback.
+    pub fn detach_all(&mut self) {
+        for p in self.slots.iter_mut().flatten() {
+            p.detach();
+        }
     }
 }
 
@@ -228,16 +326,16 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod pty_tests {
-    use super::Pty;
+    use super::Shells;
 
     #[tokio::test]
     async fn spawn_in_pty_applies_root_and_guard() {
         let pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe";
         let root = std::env::temp_dir().join("tt-guard-test").join("root");
         std::fs::create_dir_all(&root).unwrap();
-        let mut p = Pty::spawn(pwsh, Some(&root)).unwrap();
-        p.attach();
-        p.write(b"'LOC1=' + (Get-Location).Path; cd ..; 'LOC2=' + (Get-Location).Path; exit\r\n").unwrap();
+        let mut sh = Shells::new();
+        sh.open(0, pwsh, Some(&root)).unwrap();
+        sh.get(0).unwrap().write(b"'LOC1=' + (Get-Location).Path; cd ..; 'LOC2=' + (Get-Location).Path; exit\r\n").unwrap();
         let mut all = String::new();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while let Some(b) = p.out.recv().await {

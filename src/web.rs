@@ -28,7 +28,7 @@ use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-use crate::pty::Pty;
+use crate::pty::Shells;
 
 const INDEX: &str = include_str!("web/index.html");
 // xterm is bundled (no third-party scripts in the page that holds the shell session).
@@ -333,13 +333,11 @@ async fn ws_session(
     shell: &str,
     root: Option<&std::path::Path>,
     events: Option<mpsc::UnboundedSender<SessionEvent>>,
-    pty: &mut Option<Pty>,
+    shells: &mut Shells,
 ) -> Result<()> {
-    let r = ws_session_inner(ws, token, shell, root, events, pty).await;
-    // The shell outlives the connection (like tmux/Termux): only output delivery stops.
-    if let Some(p) = pty.as_mut() {
-        p.detach();
-    }
+    let r = ws_session_inner(ws, token, shell, root, events, shells).await;
+    // The shells outlive the connection (like tmux/Termux): only output delivery stops.
+    shells.detach_all();
     r
 }
 
@@ -349,7 +347,7 @@ async fn ws_session_inner(
     shell: &str,
     root: Option<&std::path::Path>,
     events: Option<mpsc::UnboundedSender<SessionEvent>>,
-    pty: &mut Option<Pty>,
+    shells: &mut Shells,
 ) -> Result<()> {
     let (mut wtx, mut wrx) = ws.split();
 
@@ -380,52 +378,67 @@ async fn ws_session_inner(
     wtx.send(WsMsg::Text(hello.to_string().into())).await?;
     let mut crypt = Crypt::new(token, &client_nonce, &host_nonce, true)?;
 
-    // 3. encrypted session; the shell starts only after the first frame decrypts (proves the token)
-    let mut attached = false;
+    // 3. encrypted session. Frames (first byte = kind):
+    //    phone -> host: 0 auth (proves the token), 1 input [id, bytes], 2 resize [id, cols u16, rows u16],
+    //                   3 ping, 5 open shell [id], 6 close shell [id]
+    //    host -> phone: 7 shell list [ids] (after auth), 1 output [id, bytes], 3 pong, 4 shell exited [id]
+    let mut authed = false;
     loop {
-        let out = async {
-            match pty.as_mut() {
-                Some(p) if attached => p.out.recv().await,
-                _ => std::future::pending().await,
-            }
-        };
         tokio::select! {
             msg = wrx.next() => match msg {
                 Some(Ok(WsMsg::Binary(b))) => {
                     let plain = crypt.open(&b)?; // any failure ends the session
                     let Some((&kind, data)) = plain.split_first() else { continue };
-                    match (kind, pty.as_mut().filter(|_| attached)) {
-                        (0, None) => {
-                            let code = match_code(token, &transcript);
-                            eprintln!("browser authenticated (WebSocket, end-to-end encrypted)");
-                            eprintln!("match code: {code}  (must be the same on the phone; if not, close the session)");
-                            if let Some(tx) = &events {
-                                let _ = tx.send(SessionEvent::Authenticated { code });
+                    if kind == 3 {
+                        let f = crypt.seal(&[3])?;
+                        wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
+                        continue;
+                    }
+                    if kind == 0 && !authed {
+                        let code = match_code(token, &transcript);
+                        eprintln!("browser authenticated (WebSocket, end-to-end encrypted)");
+                        eprintln!("match code: {code}  (must be the same on the phone; if not, close the session)");
+                        if let Some(tx) = &events {
+                            let _ = tx.send(SessionEvent::Authenticated { code });
+                        }
+                        authed = true;
+                        // Reconnect: tell the phone which shells exist and redraw each screen.
+                        let screens = shells.attach_all();
+                        let mut list = vec![7u8];
+                        list.extend(screens.iter().map(|(id, _)| *id));
+                        wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&list)?))).await?;
+                        for (id, screen) in screens {
+                            if !screen.is_empty() {
+                                let mut plain = vec![1u8, id];
+                                plain.extend_from_slice(&screen);
+                                wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&plain)?))).await?;
                             }
-                            if pty.as_mut().is_some_and(|p| p.is_alive()) {
-                                // reconnect: same shell, redraw what it showed
-                                let screen = pty.as_mut().unwrap().attach();
-                                if !screen.is_empty() {
-                                    let mut plain = vec![1u8];
-                                    plain.extend_from_slice(&screen);
-                                    let f = crypt.seal(&plain)?;
-                                    wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
-                                }
-                            } else {
-                                let mut p = Pty::spawn(shell, root)?;
-                                p.attach();
-                                *pty = Some(p);
+                        }
+                        continue;
+                    }
+                    if !authed {
+                        continue;
+                    }
+                    match (kind, data) {
+                        (1, [id, input @ ..]) => {
+                            if let Some(p) = shells.get(*id) {
+                                p.write(input)?;
                             }
-                            attached = true;
                         }
-                        (1, Some(p)) => p.write(data)?,
-                        (2, Some(p)) if data.len() == 4 => {
-                            p.resize(u16::from_be_bytes([data[0], data[1]]), u16::from_be_bytes([data[2], data[3]]))?;
+                        (2, [id, c0, c1, r0, r1]) => {
+                            if let Some(p) = shells.get(*id) {
+                                p.resize(u16::from_be_bytes([*c0, *c1]), u16::from_be_bytes([*r0, *r1]))?;
+                            }
                         }
-                        (3, _) => {
-                            let f = crypt.seal(&[3])?;
-                            wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
+                        (5, [id]) => {
+                            if let Err(e) = shells.open(*id, shell, root) {
+                                eprintln!("open shell {id}: {e:#}");
+                                // tell the phone so its tab does not hang
+                                let f = crypt.seal(&[4, *id])?;
+                                wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
+                            }
                         }
+                        (6, [id]) => shells.close(*id),
                         _ => {}
                     }
                 }
@@ -433,20 +446,23 @@ async fn ws_session_inner(
                 Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => return Ok(()),
                 Some(Ok(_)) => {}
             },
-            chunk = out => match chunk {
-                Some(b) => {
-                    let mut plain = Vec::with_capacity(1 + b.len());
-                    plain.push(1);
-                    plain.extend_from_slice(&b);
-                    let f = crypt.seal(&plain)?;
-                    wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
+            Some(m) = shells.rx.recv() => {
+                if !authed || !shells.is_current(&m) {
+                    continue;
                 }
-                None => {
-                    // shell exited: tell the phone, then end
-                    *pty = None;
-                    let f = crypt.seal(&[4])?;
-                    let _ = wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await;
-                    return Ok(());
+                match m.data {
+                    Some(b) => {
+                        let mut plain = Vec::with_capacity(2 + b.len());
+                        plain.extend_from_slice(&[1, m.id]);
+                        plain.extend_from_slice(&b);
+                        wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&plain)?))).await?;
+                    }
+                    None => {
+                        // a shell exited: tell the phone (its tab closes); the session goes on
+                        if shells.on_exit(&m) {
+                            wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&[4, m.id])?))).await?;
+                        }
+                    }
                 }
             },
         }
@@ -693,9 +709,9 @@ pub async fn host_web(shell: String, root: Option<std::path::PathBuf>, signal: O
     print_qr(&url)?;
     println!("\n{url}\n\nWaiting for browser...");
 
-    let mut pty = None;
+    let mut shells = Shells::new();
     tokio::select! {
-        r = ws_session(ws, &token, &shell, root.as_deref(), None, &mut pty) => { println!("session ended"); r }
+        r = ws_session(ws, &token, &shell, root.as_deref(), None, &mut shells) => { println!("session ended"); r }
         _ = tokio::signal::ctrl_c() => { println!(); Ok(()) }
     }
 }
@@ -727,7 +743,7 @@ pub async fn host_tray(shell: String, root: Option<std::path::PathBuf>, signal: 
     };
 
     let mut first = true;
-    let mut pty: Option<crate::pty::Pty> = None; // the shell outlives phone connections
+    let mut shells = Shells::new(); // the shells outlive phone connections
     let mut next: Option<(HostWs, String, String)> = None; // fresh link opened while a phone is connected
     loop {
         let opened = match next.take() {
@@ -761,7 +777,7 @@ pub async fn host_tray(shell: String, root: Option<std::path::PathBuf>, signal: 
         }
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
         let outcome = {
-        let session = ws_session(ws, &token, &shell, root.as_deref(), Some(ev_tx), &mut pty);
+        let session = ws_session(ws, &token, &shell, root.as_deref(), Some(ev_tx), &mut shells);
         tokio::pin!(session);
         loop {
             tokio::select! {
@@ -793,7 +809,7 @@ pub async fn host_tray(shell: String, root: Option<std::path::PathBuf>, signal: 
                 return Ok(());
             }
             Outcome::Restart => tray.update(|v| v.status = "Creating a new link...".into()),
-            Outcome::Ended(Ok(())) => tray.update(|v| v.status = if pty.is_some() { "Phone disconnected: shell keeps running".into() } else { "Session ended".into() }),
+            Outcome::Ended(Ok(())) => tray.update(|v| v.status = "Phone disconnected: shells keep running".into()),
             Outcome::Ended(Err(e)) => {
                 tray.update(|v| v.status = format!("Session ended: {e:#}"));
                 tray.notify("Session ended", &format!("{e:#}"));

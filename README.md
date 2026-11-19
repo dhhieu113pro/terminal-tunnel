@@ -64,6 +64,10 @@ iPhone home-screen icon.
 - The page follows the keyboard: it is pinned to the visible area, so the extra keys sit right above
   the keyboard, the terminal refits and the host PTY is resized to match.
 - With `TT_ROOT` set, the PowerShell prompt shows the root as `~`: `PS ~>`, `PS ~\sub>`.
+- **Tabs:** the bar above the terminal has one tab per shell, a **+** button (up to 8) and **Close** for the
+  active tab. Shells run on the PC, not in the page: if the phone disconnects they keep running, and
+  scanning the next link brings every tab back with its screen. Typing `exit` closes that tab (a fresh
+  shell opens when none are left); quitting the tray app stops all of them.
 
 ## Configuration
 
