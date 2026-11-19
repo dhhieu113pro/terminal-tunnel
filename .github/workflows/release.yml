@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: win64
+            target: x86_64-pc-windows-msvc
+          - name: win64-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "terminal-tunnel-${{ matrix.name }}"
+          New-Item -ItemType Directory $out | Out-Null
+          $bin = "target/${{ matrix.target }}/release"
+          Copy-Item "$bin/terminal-tunnel-tray.exe", "$bin/terminal-tunnel.exe", README.md $out
+          Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-tunnel-${{ matrix.name }}
+          path: terminal-tunnel-${{ matrix.name }}.zip
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "terminal-tunnel-${{ matrix.name }}.zip" --clobber --repo "${{ github.repository }}"
