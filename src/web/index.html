@@ -38,6 +38,7 @@
   #keys button:active { background:#2b3645; }
   #keys button.on { background:var(--accent); color:#000; }
   #keys button.enter { color:#f2c744; }
+  #keys button.exit { color:#ff7b72; }
 </style>
 </head>
 <body>
@@ -56,7 +57,7 @@
     <button type="button" data-k="&#x1b;[H">HOME</button>
     <button type="button" data-k="&#x1b;[A" data-repeat>&#8593;</button>
     <button type="button" data-k="&#x1b;[F">END</button>
-    <button type="button" data-k="&#x1b;[5~">PGUP</button>
+    <button type="button" id="exit" class="exit">Exit</button>
     <button type="button" data-k="&#9;">&#8633;</button>
     <button type="button" id="ctrl">CTRL</button>
     <button type="button" id="alt">ALT</button>
@@ -146,8 +147,12 @@ function hmacSha256(key, msg) {
   addEventListener('error', e => setStatus('Script error: ' + e.message, 'err'));
   addEventListener('unhandledrejection', e => setStatus('Unhandled error: ' + (e.reason && e.reason.message || e.reason), 'err'));
   const room = location.pathname.split('/').pop();
-  const token = location.hash.slice(1);
-  history.replaceState(null, '', location.pathname); // keep the token out of history
+  const tokKey = 'tt:' + room;
+  let token = location.hash.slice(1);
+  try { if (token) sessionStorage.setItem(tokKey, token); else token = sessionStorage.getItem(tokKey) || ''; } catch (e) { /* storage blocked */ }
+  history.replaceState(null, '', location.pathname); // keep the token out of history and the address bar
+  let curWs = null, hadSession = false, keepAlive = null;
+  let finished = false;                      // the user pressed Exit (or the host ended the session): no reconnect
 
   if (typeof Terminal === 'undefined' || typeof FitAddon === 'undefined') {
     setStatus('Could not load the terminal scripts from ' + location.host + ': the host has probably stopped (it exits when a session ends or the link expires). Restart host-web and rescan.', 'err');
@@ -264,6 +269,15 @@ function hmacSha256(key, msg) {
     });
     for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) b.addEventListener(ev, stop);
   });
+  document.getElementById('exit').addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (!confirm('Exit: disconnect and retire this link?\nThe shells keep running on the PC; scan the next QR code to come back.')) return;
+    finished = true;
+    try { sessionStorage.removeItem(tokKey); } catch (err) { /* storage blocked */ }
+    sendMsg(8, new Uint8Array(0));
+    setStatus('Exited. Scan a new QR code to connect again.', 'warn');
+    setTimeout(() => { try { curWs && curWs.close(); } catch (err) { /* already closed */ } }, 300);
+  });
   const onTermData = (id, d) => {
     if (ctrl && d.length === 1) {            // sticky CTRL
       const c = d.toUpperCase().charCodeAt(0);
@@ -299,12 +313,16 @@ function hmacSha256(key, msg) {
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}/ws/${room}/client`);
+    curWs = ws;
     ws.binaryType = 'arraybuffer';
     const end = (msg, level) => { ended = true; setStatus(msg, level); try { ws.close(); } catch (e) { /* already closed */ } };
     ws.onclose = e => {
       log('socket closed: code ' + e.code + (e.reason ? ', reason "' + e.reason + '"' : ''));
-      if (ended) return;
-      if (verified) setStatus('Disconnected (the connection dropped or the host stopped)', 'warn');
+      clearInterval(keepAlive);
+      if (ended || finished) return;
+      if (e.code === 4001) { finished = true; return setStatus('This link was opened in another window or tab, which took over.', 'warn'); }
+      if (verified) { verified = false; wsOut = null; reconnect('Connection lost'); }
+      else if (hadSession) reconnect('Connection failed');
       else setStatus('Signaling closed: ' + (e.reason || ('no reason given, code ' + e.code)), 'err');
     };
     await new Promise((res, rej) => {
@@ -327,6 +345,7 @@ function hmacSha256(key, msg) {
       if (typeof e.data === 'string') {
         const m = JSON.parse(e.data);
         if (m.t === 'peer-left') {
+          if (verified) { finished = true; try { sessionStorage.removeItem(tokKey); } catch (err) { /* storage blocked */ } }
           return end(verified ? 'The host ended the session.' : 'The host left before the handshake finished (the link expired or the host stopped).', verified ? 'warn' : 'err');
         }
         if (m.t !== 'hello' || kH2C) return;
@@ -344,7 +363,9 @@ function hmacSha256(key, msg) {
         const code = String(Math.floor(n / 1000)).padStart(3, '0') + ' ' + String(n % 1000).padStart(3, '0');
         setStatus('Connected (end-to-end encrypted over WebSocket, verified) · match code ' + code);
         wsOut(0, new Uint8Array(0));            // first encrypted frame: proves the token; the host answers with its shell list
-        setInterval(() => wsOut(3, new Uint8Array(0)), 20000);   // keep-alive through proxies
+        hadSession = true;
+        clearInterval(keepAlive);
+        keepAlive = setInterval(() => wsOut && wsOut(3, new Uint8Array(0)), 20000);   // keep-alive through proxies
         return;
       }
       if (!kH2C) return;
@@ -356,8 +377,10 @@ function hmacSha256(key, msg) {
         plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce(2, ctr), additionalData: AAD }, kH2C, f.subarray(8)));
       } catch (err) { return end('Decryption failed: tampered data or wrong token. Disconnected.', 'err'); }
       recvCtr++;
-      if (plain[0] === 7) {                    // shells that already run on the host (reconnect)
-        for (const id of plain.subarray(1)) addShell(id);
+      if (plain[0] === 7) {                    // shells that already run on the host (reload / reconnect)
+        const ids = new Set(plain.subarray(1));
+        for (const id of [...shells.keys()]) { if (ids.has(id)) shells.get(id).term.reset(); else removeShell(id); }   // the screens are replayed
+        for (const id of ids) addShell(id);
         if (shells.size === 0) openShell();
         else { activate(shells.keys().next().value); focusTerm(); }
       } else if (plain[0] === 1) { const s = shells.get(plain[1]); if (s) s.term.write(plain.subarray(2)); }
@@ -372,7 +395,19 @@ function hmacSha256(key, msg) {
     ws.send(JSON.stringify({ t: 'hello', n: hex(cn) }));
   }
 
-  start().catch(e => setStatus('Error: ' + (e && e.message || e), 'err'));
+  // The link keeps working until Exit: after a drop (or a reload) the page reconnects by itself.
+  let retries = 0;
+  function reconnect(why) {
+    if (finished) return;
+    retries++;
+    setStatus(why + '. Reconnecting… (' + retries + ')', 'warn');
+    setTimeout(() => { start().then(() => { retries = 0; }).catch(onStartError); }, Math.min(2000 * retries, 10000));
+  }
+  function onStartError(e) {
+    if (hadSession && !finished) reconnect('Connection failed');
+    else setStatus('Error: ' + (e && e.message || e), 'err');
+  }
+  start().catch(onStartError);
 })();
 </script>
 </body>

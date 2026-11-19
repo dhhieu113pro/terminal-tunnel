@@ -469,7 +469,7 @@ unsafe fn paint(hwnd: HWND) {
         }
 
         // Footer: hint and the (truncated) link.
-        let hint = if view.qr.is_some() { "Scan with your phone camera. Single-use link." } else { "Please wait..." };
+        let hint = if view.qr.is_some() { "Scan with your phone camera. Valid until you press Exit." } else { "Please wait..." };
         text_out(hdc, hint, RECT { left: 32, top: 436, right: CLIENT_W - 32, bottom: 456 }, f_small, dim, DT_CENTER | DT_SINGLELINE);
         if let Some(link) = &view.link {
             text_out(hdc, link, RECT { left: 32, top: 458, right: CLIENT_W - 32, bottom: 478 }, f_small, rgb(90, 96, 108), DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_PATH_ELLIPSIS);

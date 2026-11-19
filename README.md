@@ -13,8 +13,9 @@ https, it works through firewalls, NAT, VPNs and mobile networks (e.g. via a Mic
 cargo run -q -- host-web            # the Dev Tunnel is the default
 ```
 
-Scan the QR code with the phone camera, sign in when asked, and you get a shell. The link is
-**single-use**: restart `host-web` and rescan for a new session. Press Ctrl+C to stop.
+Scan the QR code with the phone camera, sign in when asked, and you get a shell. The link works
+until you press **Exit** on the phone (reloading the page or a dropped connection reconnect by
+themselves). Restart `host-web` and rescan for a new session. Press Ctrl+C to stop.
 
 ## Tray app (Windows): no command line needed
 
@@ -40,9 +41,10 @@ crate) and keeps the Dev Tunnel and relay up, so nothing needs restarting:
 - A window with the **QR code** and status opens at startup; closing it only hides it.
 - Left-click the tray icon to show the QR window; right-click for the menu: **Show QR code**,
   **Copy link**, **New session**, **Quit**.
-- After a session ends (or you pick New session) a **fresh single-use link** is created
-  automatically and a notification says so. While a phone is connected the link is used up (nothing
-  to copy) and the status shows the match code.
+- After the phone presses Exit (or you pick New session) a **fresh link** is created automatically
+  and a notification says so. Until then the same link stays valid, so the phone can reload or
+  reconnect with it (a newer connection replaces the older one); each connection shows a match code
+  in the status and in a notification.
 - Tray mode always uses the Dev Tunnel unless you pass `--signal`. If it cannot start (not logged in,
   tunnel limit, ...) an error box says why.
 - Release builds are stripped and use thin LTO (`[profile.release]` in `Cargo.toml`), about 4.7 MB each.
@@ -58,9 +60,10 @@ iPhone home-screen icon.
 
 ## On the phone
 
-- Extra keys in the Termux layout above the keyboard: `ESC / - HOME ↑ END PGUP` and
+- Extra keys in the Termux layout above the keyboard: `ESC / - HOME ↑ END Exit` and
   `TAB CTRL ALT ← ↓ → Enter`. CTRL and ALT are sticky (tap, then the next key); arrows repeat while
-  held; tapping a key never closes the on-screen keyboard.
+  held; tapping a key never closes the on-screen keyboard. **Exit** asks for confirmation, then
+  disconnects and retires the link (the shells keep running on the PC).
 - The page follows the keyboard: it is pinned to the visible area, so the extra keys sit right above
   the keyboard, the terminal refits and the host PTY is resized to match.
 - With `TT_ROOT` set, the PowerShell prompt shows the root as `~`: `PS ~>`, `PS ~\sub>`.
@@ -154,8 +157,10 @@ tt.example.com {
   `X-Frame-Options: DENY` and `no-store`.
 - The relay limits abuse: at most 64 rooms, host rooms expire after 10 min while waiting, paired
   sessions after 30 min idle (the page pings every 20 s). With `--devtunnel` it listens on loopback only.
-- Someone who has the link but not the token can still connect first and fail the handshake, which
-  burns the single-use link (and ends `host-web`). They cannot get a shell.
+- Someone who has the link but not the token can connect and fail the handshake; that only replaces the
+  phone connection (it reconnects by itself) and gives no shell. Anyone who has the whole link (with the
+  token after the `#`) can use it until you press Exit, so do not share it; each connection shows a match
+  code and a notification on the PC.
 - The page shows errors in a banner and keeps a timestamped **Log** (tap the Log button, then Copy
   log) for troubleshooting.
 

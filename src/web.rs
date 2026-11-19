@@ -6,7 +6,7 @@
 //!   phone : opens the link (the token stays in the URL fragment, never sent to any server), connects
 //!           to the same room; both sides run the encrypted handshake described in the WebSocket
 //!           transport section below. The relay only forwards opaque frames.
-//!   The room is single-use: one host, one client.
+//!   A room has one host and one client at a time; a newer client replaces the older one.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -51,8 +51,12 @@ const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 #[derive(Default)]
 struct Room {
     host: Option<mpsc::UnboundedSender<Message>>,
-    client: Option<mpsc::UnboundedSender<Message>>,
+    /// The connected phone (connection id, sender). A reload or reconnect replaces it.
+    client: Option<(u64, mpsc::UnboundedSender<Message>)>,
+    /// A phone has connected at least once (the host then waits longer for it to come back).
+    used: bool,
 }
+static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 type Rooms = Arc<Mutex<HashMap<String, Room>>>;
 
 /// Adds browser hardening headers to every response. No third-party sources are allowed.
@@ -118,11 +122,13 @@ async fn ws_handler(
     ws.max_message_size(64 * 1024).on_upgrade(move |s| relay(s, rooms, room, is_host))
 }
 
-/// Pairs one host with exactly one client per room and forwards text and binary messages between
+/// Pairs one host with one client per room (a newer client replaces the old one, so a page reload
+/// or a dropped connection can come back with the same link) and forwards text and binary messages between
 /// them. The frames are end-to-end encrypted, so the relay never sees plaintext terminal data.
 async fn relay(sock: WebSocket, rooms: Rooms, room: String, is_host: bool) {
     let (mut tx, mut rx) = sock.split();
     let (my_tx, mut my_rx) = mpsc::unbounded_channel::<Message>();
+    let conn_id = NEXT_CONN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Why this connection was refused, if it was (sent to the peer as the WebSocket close reason).
     let rejected: Option<&'static str> = {
         let mut g = rooms.lock().unwrap();
@@ -130,15 +136,22 @@ async fn relay(sock: WebSocket, rooms: Rooms, room: String, is_host: bool) {
             if g.contains_key(&room) || g.len() >= MAX_ROOMS {
                 Some("room unavailable") // cannot hijack an existing room; bounded memory
             } else {
-                g.insert(room.clone(), Room { host: Some(my_tx), client: None });
+                g.insert(room.clone(), Room { host: Some(my_tx), client: None, used: false });
                 None
             }
         } else {
             match g.get_mut(&room) {
                 None => Some("no host is waiting for this link (it expired, the host stopped, or the link is wrong)"),
-                Some(r) if r.client.is_some() => Some("link already used (single-use): restart host-web and rescan"),
                 Some(r) => {
-                    r.client = Some(my_tx); // stays taken: single-use
+                    if let Some((_, old)) = r.client.take() {
+                        // reload / reconnect: the old connection is dropped and the host starts over
+                        let _ = old.send(Message::Close(Some(CloseFrame { code: 4001, reason: "replaced by a newer connection".into() })));
+                        if let Some(h) = &r.host {
+                            let _ = h.send(Message::Text(r#"{"t":"peer-left"}"#.into()));
+                        }
+                    }
+                    r.client = Some((conn_id, my_tx));
+                    r.used = true;
                     None
                 }
             }
@@ -162,16 +175,22 @@ async fn relay(sock: WebSocket, rooms: Rooms, room: String, is_host: bool) {
             .lock()
             .unwrap()
             .get(&room)
-            .is_some_and(|r| r.host.is_some() && r.client.is_some());
+            .is_some_and(|r| (r.host.is_some() && r.client.is_some()) || (is_host && r.used));
         let idle = if paired { SESSION_IDLE } else if is_host { HOST_ROOM_TTL } else { CLIENT_TTL };
         let Ok(Some(Ok(msg))) = tokio::time::timeout(idle, rx.next()).await else { break };
         match msg {
             Message::Text(_) | Message::Binary(_) => {
                 let g = rooms.lock().unwrap();
                 if let Some(r) = g.get(&room) {
-                    let peer = if is_host { &r.client } else { &r.host };
-                    if let Some(p) = peer {
-                        let _ = p.send(msg);
+                    if is_host {
+                        if let Some((_, p)) = &r.client {
+                            let _ = p.send(msg);
+                        }
+                    } else if r.client.as_ref().is_some_and(|(id, _)| *id == conn_id) {
+                        // only the current phone may talk to the host (a replaced one is ignored)
+                        if let Some(p) = &r.host {
+                            let _ = p.send(msg);
+                        }
                     }
                 }
             }
@@ -180,10 +199,16 @@ async fn relay(sock: WebSocket, rooms: Rooms, room: String, is_host: bool) {
         }
     }
     // Tell the other side this one is gone.
-    if let Some(r) = rooms.lock().unwrap().get(&room) {
-        let peer = if is_host { &r.client } else { &r.host };
-        if let Some(p) = peer {
-            let _ = p.send(Message::Text(r#"{"t":"peer-left"}"#.into()));
+    if let Some(r) = rooms.lock().unwrap().get_mut(&room) {
+        if is_host {
+            if let Some((_, p)) = &r.client {
+                let _ = p.send(Message::Text(r#"{"t":"peer-left"}"#.into()));
+            }
+        } else if r.client.as_ref().is_some_and(|(id, _)| *id == conn_id) {
+            r.client = None; // the link stays valid: the phone can come back
+            if let Some(p) = &r.host {
+                let _ = p.send(Message::Text(r#"{"t":"peer-left"}"#.into()));
+            }
         }
     }
     writer.abort();
@@ -325,35 +350,62 @@ type HostWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStre
 pub enum SessionEvent {
     /// The phone proved the token and the shell started; `code` is the match code to compare.
     Authenticated { code: String },
+    /// The phone went away (closed the page, lost the network, reloaded): the link still works.
+    PhoneLeft,
 }
 
+/// Why one phone connection ended.
+enum Ended {
+    /// The phone left or was replaced; the link stays valid for the next connection.
+    PhoneLeft,
+    /// The user pressed Exit on the phone: end the session and retire the link.
+    Exit,
+    /// The connection to the relay itself closed.
+    Closed,
+}
+
+/// Serve phones on one link until the user presses Exit (or the relay connection closes). A phone
+/// that disconnects, reloads the page or reconnects can come back with the same link; the shells
+/// outlive every connection (like tmux/Termux).
 async fn ws_session(
-    ws: HostWs,
+    ws: &mut HostWs,
     token: &str,
     shell: &str,
     root: Option<&std::path::Path>,
     events: Option<mpsc::UnboundedSender<SessionEvent>>,
     shells: &mut Shells,
 ) -> Result<()> {
-    let r = ws_session_inner(ws, token, shell, root, events, shells).await;
-    // The shells outlive the connection (like tmux/Termux): only output delivery stops.
-    shells.detach_all();
-    r
+    loop {
+        let r = ws_once(ws, token, shell, root, events.clone(), shells).await;
+        shells.detach_all();
+        match r {
+            Ok(Ended::PhoneLeft) => {
+                if let Some(tx) = &events {
+                    let _ = tx.send(SessionEvent::PhoneLeft);
+                }
+            }
+            Ok(Ended::Exit) | Ok(Ended::Closed) => return Ok(()),
+            Err(e) => {
+                // a bad or broken phone connection must not burn the link
+                eprintln!("connection ended: {e:#}");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
 }
 
-async fn ws_session_inner(
-    ws: HostWs,
+async fn ws_once(
+    ws: &mut HostWs,
     token: &str,
     shell: &str,
     root: Option<&std::path::Path>,
     events: Option<mpsc::UnboundedSender<SessionEvent>>,
     shells: &mut Shells,
-) -> Result<()> {
-    let (mut wtx, mut wrx) = ws.split();
+) -> Result<Ended> {
 
     // 1. wait for the phone's hello
     let client_nonce = loop {
-        match wrx.next().await {
+        match ws.next().await {
             Some(Ok(WsMsg::Text(t))) => {
                 let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap_or_default();
                 if v["t"] == "hello" {
@@ -365,7 +417,7 @@ async fn ws_session_inner(
                 }
             }
             Some(Ok(_)) => {}
-            _ => bail!("signaling connection closed"),
+            _ => return Ok(Ended::Closed),
         }
     };
 
@@ -375,23 +427,23 @@ async fn ws_session_inner(
     let transcript = format!("{}|{}", hex::encode(&client_nonce), hex::encode(host_nonce));
     let proof = new_mac(token, "host", &transcript).finalize().into_bytes();
     let hello = serde_json::json!({ "t": "hello", "n": hex::encode(host_nonce), "p": hex::encode(proof) });
-    wtx.send(WsMsg::Text(hello.to_string().into())).await?;
+    ws.send(WsMsg::Text(hello.to_string().into())).await?;
     let mut crypt = Crypt::new(token, &client_nonce, &host_nonce, true)?;
 
     // 3. encrypted session. Frames (first byte = kind):
     //    phone -> host: 0 auth (proves the token), 1 input [id, bytes], 2 resize [id, cols u16, rows u16],
-    //                   3 ping, 5 open shell [id], 6 close shell [id]
+    //                   3 ping, 5 open shell [id], 6 close shell [id], 8 exit (end the session, retire the link)
     //    host -> phone: 7 shell list [ids] (after auth), 1 output [id, bytes], 3 pong, 4 shell exited [id]
     let mut authed = false;
     loop {
         tokio::select! {
-            msg = wrx.next() => match msg {
+            msg = ws.next() => match msg {
                 Some(Ok(WsMsg::Binary(b))) => {
                     let plain = crypt.open(&b)?; // any failure ends the session
                     let Some((&kind, data)) = plain.split_first() else { continue };
                     if kind == 3 {
                         let f = crypt.seal(&[3])?;
-                        wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
+                        ws.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
                         continue;
                     }
                     if kind == 0 && !authed {
@@ -406,12 +458,12 @@ async fn ws_session_inner(
                         let screens = shells.attach_all();
                         let mut list = vec![7u8];
                         list.extend(screens.iter().map(|(id, _)| *id));
-                        wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&list)?))).await?;
+                        ws.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&list)?))).await?;
                         for (id, screen) in screens {
                             if !screen.is_empty() {
                                 let mut plain = vec![1u8, id];
                                 plain.extend_from_slice(&screen);
-                                wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&plain)?))).await?;
+                                ws.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&plain)?))).await?;
                             }
                         }
                         continue;
@@ -435,15 +487,16 @@ async fn ws_session_inner(
                                 eprintln!("open shell {id}: {e:#}");
                                 // tell the phone so its tab does not hang
                                 let f = crypt.seal(&[4, *id])?;
-                                wtx.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
+                                ws.send(WsMsg::Binary(bytes::Bytes::from(f))).await?;
                             }
                         }
                         (6, [id]) => shells.close(*id),
+                        (8, _) => return Ok(Ended::Exit),
                         _ => {}
                     }
                 }
-                Some(Ok(WsMsg::Text(t))) if t.as_str().contains("peer-left") => return Ok(()),
-                Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => return Ok(()),
+                Some(Ok(WsMsg::Text(t))) if t.as_str().contains("peer-left") => return Ok(Ended::PhoneLeft),
+                Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => return Ok(Ended::Closed),
                 Some(Ok(_)) => {}
             },
             Some(m) = shells.rx.recv() => {
@@ -455,12 +508,12 @@ async fn ws_session_inner(
                         let mut plain = Vec::with_capacity(2 + b.len());
                         plain.extend_from_slice(&[1, m.id]);
                         plain.extend_from_slice(&b);
-                        wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&plain)?))).await?;
+                        ws.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&plain)?))).await?;
                     }
                     None => {
                         // a shell exited: tell the phone (its tab closes); the session goes on
                         if shells.on_exit(&m) {
-                            wtx.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&[4, m.id])?))).await?;
+                            ws.send(WsMsg::Binary(bytes::Bytes::from(crypt.seal(&[4, m.id])?))).await?;
                         }
                     }
                 }
@@ -704,14 +757,14 @@ async fn open_room(p: &Prepared) -> Result<(HostWs, String, String)> {
 /// One session in the console: print the QR, wait for the phone, end when the session ends.
 pub async fn host_web(shell: String, root: Option<std::path::PathBuf>, signal: Option<String>, port: u16, devtunnel: bool, tunnel_anonymous: bool, tunnel_id: String) -> Result<()> {
     let p = prepare(signal, port, devtunnel, tunnel_anonymous, &tunnel_id).await?;
-    let (ws, token, url) = open_room(&p).await?;
-    println!("Scan with the iPhone camera (single-use link, gives a shell on this machine):\n");
+    let (mut ws, token, url) = open_room(&p).await?;
+    println!("Scan with the iPhone camera (gives a shell on this machine; Exit on the phone retires the link):\n");
     print_qr(&url)?;
     println!("\n{url}\n\nWaiting for browser...");
 
     let mut shells = Shells::new();
     tokio::select! {
-        r = ws_session(ws, &token, &shell, root.as_deref(), None, &mut shells) => { println!("session ended"); r }
+        r = ws_session(&mut ws, &token, &shell, root.as_deref(), None, &mut shells) => { println!("session ended"); r }
         _ = tokio::signal::ctrl_c() => { println!(); Ok(()) }
     }
 }
@@ -744,13 +797,8 @@ pub async fn host_tray(shell: String, root: Option<std::path::PathBuf>, signal: 
 
     let mut first = true;
     let mut shells = Shells::new(); // the shells outlive phone connections
-    let mut next: Option<(HostWs, String, String)> = None; // fresh link opened while a phone is connected
     loop {
-        let opened = match next.take() {
-            Some(x) => Ok(x),
-            None => open_room(&p).await,
-        };
-        let (ws, token, url) = match opened {
+        let (mut ws, token, url) = match open_room(&p).await {
             Ok(x) => x,
             Err(e) => {
                 tray.set_link(None);
@@ -777,23 +825,19 @@ pub async fn host_tray(shell: String, root: Option<std::path::PathBuf>, signal: 
         }
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
         let outcome = {
-        let session = ws_session(ws, &token, &shell, root.as_deref(), Some(ev_tx), &mut shells);
+        let session = ws_session(&mut ws, &token, &shell, root.as_deref(), Some(ev_tx), &mut shells);
         tokio::pin!(session);
         loop {
             tokio::select! {
                 r = &mut session => break Outcome::Ended(r),
                 Some(ev) = ev_rx.recv() => match ev {
                     SessionEvent::Authenticated { code } => {
-                        // The phone used up its link: show a different, fresh one right away.
-                        match open_room(&p).await {
-                            Ok((w2, t2, u2)) => {
-                                tray.set_link(Some(u2.clone()));
-                                next = Some((w2, t2, u2));
-                            }
-                            Err(_) => tray.set_link(None),
-                        }
-                        tray.update(|v| v.status = format!("Phone connected. Match code {code}. New link ready"));
+                        // The link stays valid (reload / reconnect work) until Exit or New session.
+                        tray.update(|v| v.status = format!("Phone connected. Match code {code}"));
                         tray.notify("Phone connected", &format!("Match code {code}: compare it with the phone."));
+                    }
+                    SessionEvent::PhoneLeft => {
+                        tray.update(|v| v.status = "Phone disconnected: it can reconnect with this link. Shells keep running".into());
                     }
                 },
                 c = cmd_rx.recv() => match c {
@@ -809,7 +853,7 @@ pub async fn host_tray(shell: String, root: Option<std::path::PathBuf>, signal: 
                 return Ok(());
             }
             Outcome::Restart => tray.update(|v| v.status = "Creating a new link...".into()),
-            Outcome::Ended(Ok(())) => tray.update(|v| v.status = "Phone disconnected: shells keep running".into()),
+            Outcome::Ended(Ok(())) => tray.update(|v| v.status = "Session ended: creating a new link...".into()),
             Outcome::Ended(Err(e)) => {
                 tray.update(|v| v.status = format!("Session ended: {e:#}"));
                 tray.notify("Session ended", &format!("{e:#}"));
